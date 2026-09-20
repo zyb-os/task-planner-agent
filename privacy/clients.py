@@ -99,7 +99,16 @@ class AnthropicPrivacyClient:
             )
             r.raise_for_status()
             data = r.json()
-            text = next(b["text"] for b in data["content"] if b["type"] == "text")
+            text_blocks = [b["text"] for b in data["content"] if b.get("type") == "text" and b.get("text")]
+            if not text_blocks:
+                raise ValueError(
+                    f"LLM response contained no usable text content "
+                    f"(stop_reason={data.get('stop_reason')!r}, "
+                    f"model={data.get('model')!r}). "
+                    "If using a Qwen3/thinking model, the response may have been "
+                    "entirely a reasoning block with no answer after </think>."
+                )
+            text = text_blocks[0]
 
         # ── Optionally restore ────────────────────────────────────────────────
         if self._privacy.enabled and privacy_ctx is not None:

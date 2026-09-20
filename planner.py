@@ -25,12 +25,33 @@ logger = logging.getLogger(__name__)
 # ── Capability cache TTL ───────────────────────────────────────────────────────
 _CAPS_CACHE_TTL_S: float = 60.0   # re-fetch agents at most once per minute
 _COMPACT_CAP_LIMIT: int = 10
-_MAX_OPTIONAL_FIELDS_PER_CAP: int = 2
 _MAX_MEMORY_CONTEXT_CHARS: int = 1200
-_TYPE_ABBREV: dict[str, str] = {
-    "string": "str", "integer": "int", "number": "num",
-    "boolean": "bool", "object": "obj", "array": "arr",
+# Micro type-codes for the dense compact format.  String — the modal field
+# type — carries no code at all (its absence implies string), so only the
+# rarer non-string types cost a character.  Each code is a single character
+# to stay one BPE token.
+_TYPE_MICRO: dict[str, str] = {
+    "string": "", "integer": "i", "number": "n",
+    "boolean": "b", "object": "o", "array": "a",
 }
+# Boilerplate openers LLM-authored capability descriptions tend to start with.
+# Stripping them is lossless for planning and saves 3–6 tokens per capability.
+_DESC_PREFIX_RE = re.compile(
+    r"^(use this (capability |tool )?to |this (capability |tool |agent )|"
+    r"allows? (you )?to |enables? (you )?to |lets? you |used to )",
+    re.IGNORECASE,
+)
+
+
+def _micro_field(name: str, properties: dict, required: bool) -> str:
+    """Render one field as a micro-token: ``name`` (+ ``:code`` for non-string)
+    (+ ``!`` when required).  Examples: ``task!``  ``channel!``  ``limit:i``."""
+    raw_type = (properties.get(name) or {}).get("type", "")
+    if isinstance(raw_type, list):
+        raw_type = raw_type[0] if raw_type else ""
+    code = "" if not raw_type else _TYPE_MICRO.get(raw_type, "?")
+    token = f"{name}:{code}" if code else name
+    return f"{token}!" if required else token
 _SENSITIVE_KEYWORDS = (
     "password", "passcode", "otp", "token", "api key", "secret", "ssn",
     "social security", "credit card", "card number", "cvv", "bank account",
@@ -263,6 +284,25 @@ Rules:
 """
 
 
+_READINESS_SYSTEM_PROMPT = """\
+Assess whether a clarification conversation has provided enough information to generate
+a fully executable workflow plan. Output JSON only:
+
+Ready:     {"ready": true}
+Not ready: {"ready": false, "follow_up_questions": ["Q1?", "Q2?"], "understood_as": "restatement"}
+
+Rules:
+- "ready" = true when: targets/recipients/constraints are concrete, every plan step can
+  be expressed with real capability inputs (no placeholders or guesses required), and
+  there is no ambiguity about scope or desired output format.
+- "ready" = false ONLY when missing information would cause a step to fail at runtime
+  (e.g. unknown recipient email, unspecified date, ambiguous target system).
+- Maximum 2 follow-up questions per round. Ask only for what is genuinely missing.
+- Do NOT re-ask anything already answered in the conversation history.
+- If answers are vague but workable with reasonable defaults, lean toward ready=true.
+- Memory context = confirmed facts. Do not ask about anything already in memory.
+"""
+
 _FOLLOWUP_MEMORY_SYSTEM_PROMPT = """\
 You answer whether a follow-up question can be resolved from provided memory context only.
 Return strict JSON only:
@@ -319,6 +359,15 @@ class TaskPlanner:
         self._provider = "anthropic"
         self._max_tokens = max_tokens
 
+        # Per-task-type model overrides.
+        # _model_fast   — cheap/fast model for classification, decomposition,
+        #                 clarification checks, and memory lookups.
+        #                 Falls back to _model when not set.
+        # _model_plan   — powerful model for actual plan generation.
+        #                 Falls back to _model when not set.
+        self._model_fast: str = ""
+        self._model_plan: str = ""
+
         # Privacy proxy — set once here; enabled flag toggled via set_privacy_proxy / settings_push
         _privacy = privacy_proxy or PrivacyProxy()
         self._llm_client = AnthropicPrivacyClient(
@@ -370,6 +419,19 @@ class TaskPlanner:
                 self._model = candidate
                 break
 
+        # Per-task-type model overrides (empty string = fall back to _model).
+        # planner_model_fast  → quick tasks: classification, decomposition,
+        #                       clarification, memory lookup.
+        # planner_model_plan  → heavy tasks: actual plan/workflow generation.
+        self._model_fast = (
+            str(agent_settings.get("planner_model_fast", "")).strip()
+            or str(common_settings.get("planner_model_fast", "")).strip()
+        )
+        self._model_plan = (
+            str(agent_settings.get("planner_model_plan", "")).strip()
+            or str(common_settings.get("planner_model_plan", "")).strip()
+        )
+
         for candidate in (
             str(agent_settings.get("planner_provider", "")).strip(),
             str(common_settings.get("default_provider", "")).strip(),
@@ -406,9 +468,13 @@ class TaskPlanner:
             self._skill_replay_threshold = 0.75
 
         logger.info(
-            "Planner settings updated: model=%s provider=%s vector_search=%s top_k=%d "
-            "multiphase=%s tool_discovery=%s skill_learning=%s threshold=%.2f",
-            self._model, self._provider,
+            "Planner settings updated: model=%s (fast=%s plan=%s) provider=%s "
+            "vector_search=%s top_k=%d multiphase=%s tool_discovery=%s "
+            "skill_learning=%s threshold=%.2f",
+            self._model,
+            self._model_fast or "(same)",
+            self._model_plan or "(same)",
+            self._provider,
             self._vector_search_enabled, self._vector_search_top_k,
             self._vector_search_multiphase, self._tool_discovery_enabled,
             self._skill_learning_enabled, self._skill_replay_threshold,
@@ -486,6 +552,7 @@ class TaskPlanner:
         segments: list[dict] | None = None,
         *,
         privacy_ctx: PrivacyContext | None = None,
+        model: str = "",
     ) -> str:
         """
         Send a completion request to the orchestrator LLM proxy and return the response text.
@@ -496,18 +563,23 @@ class TaskPlanner:
         When *privacy_ctx* is provided (and the privacy proxy is enabled) the
         payload is redacted before sending and the response is restored before
         returning.
+
+        When *model* is provided it overrides ``self._model`` for this single call.
+        Pass ``self._model_fast`` for lightweight classification/decomposition tasks,
+        or ``self._model_plan`` for full plan generation.
         """
+        effective_model = model or self._model
         if segments:
             payload: dict = {
                 "provider": self._provider,
-                "model": self._model,
+                "model": effective_model,
                 "max_tokens": max_tokens,
                 "prompt_segments": segments,
             }
         else:
             payload = {
                 "provider": self._provider,
-                "model": self._model,
+                "model": effective_model,
                 "messages": messages,
                 "system": system,
                 "max_tokens": max_tokens,
@@ -524,14 +596,17 @@ class TaskPlanner:
         max_tokens: int,
         *,
         privacy_ctx: PrivacyContext | None = None,
+        model: str = "",
     ) -> dict:
         """
         Like _proxy_complete but returns the full response dict
         (content list + stop_reason) for tool-use responses.
+
+        When *model* is provided it overrides ``self._model`` for this call.
         """
         payload: dict = {
             "provider": self._provider,
-            "model": self._model,
+            "model": model or self._model,
             "messages": messages,
             "system": system,
             "tools": tools,
@@ -841,32 +916,21 @@ class TaskPlanner:
         for agent_name, agent_caps in by_agent.items():
             lines.append(f"[{agent_name}]")
             for cap_name, cap_dict, score in agent_caps:
-                desc = (cap_dict.get("description") or "")[:100]
+                desc = self._trim_desc(cap_dict.get("description") or "")
                 cost = cap_dict.get("cost") or {}
                 cost_usd = cost.get("estimated_cost_usd")
-                cost_str = f"${cost_usd:.4f}" if cost_usd else "free"
+                cost_str = f"${cost_usd:.4f}" if cost_usd else ""
                 schema = cap_dict.get("input_schema") or {}
                 props = schema.get("properties") or {}
                 required = list(schema.get("required") or [])
                 optional = [f for f in props if f not in required]
 
-                field_parts: list[str] = []
-                for f in required:
-                    fi = props.get(f) or {}
-                    raw_type = fi.get("type", "") if isinstance(fi, dict) else ""
-                    if isinstance(raw_type, list):
-                        raw_type = raw_type[0] if raw_type else ""
-                    ftype = _TYPE_ABBREV.get(raw_type, "any")
-                    field_parts.append(f"{f}({ftype},REQ)")
-                for f in optional[:_MAX_OPTIONAL_FIELDS_PER_CAP]:
-                    fi = props.get(f) or {}
-                    raw_type = fi.get("type", "") if isinstance(fi, dict) else ""
-                    if isinstance(raw_type, list):
-                        raw_type = raw_type[0] if raw_type else ""
-                    ftype = _TYPE_ABBREV.get(raw_type, "any")
-                    field_parts.append(f"{f}({ftype})")
+                # Same drop-inferred micro-encoding as _format_caps_compact.
+                field_parts = [_micro_field(f, props, True) for f in required]
+                field_parts += [_micro_field(f, props, False) for f in optional]
 
-                line = f"  {cap_name} ({cost_str}, relevance:{score:.2f})"
+                meta = f"${cost_str[1:]}, " if cost_str else ""
+                line = f"  {cap_name} ({meta}rel:{score:.2f})"
                 if desc:
                     line += f": {desc}"
                 if field_parts:
@@ -877,7 +941,7 @@ class TaskPlanner:
                 path_constraint = agent_meta.get("fs_allowed_paths") or None
                 if path_constraint:
                     roots_str = ", ".join(str(p) for p in path_constraint)
-                    lines.append(f"    [paths must be within: {roots_str}]")
+                    lines.append(f"    [paths⊂{roots_str}]")
         return "\n".join(lines)
 
     # ── Multi-phase goal decomposition ─────────────────────────────────────
@@ -922,6 +986,8 @@ class TaskPlanner:
                     },
                 ],
                 privacy_ctx=privacy_ctx,
+                # Decomposition is a lightweight classification — use fast model if configured.
+                model=self._model_fast or self._model,
             )
             result = self._extract_json(raw)
             phases = result.get("phases") or []
@@ -1019,12 +1085,61 @@ class TaskPlanner:
                     },
                 ],
                 privacy_ctx=privacy_ctx,
+                # Clarification check is a yes/no decision — use fast model if configured.
+                model=self._model_fast or self._model,
             )
             logger.debug("Clarification check response: %s", raw[:300])
             return self._extract_json(raw)
         except Exception as exc:
             logger.warning("Clarification check failed (fail open): %s", exc)
             return {"needs_clarification": False}
+
+    async def assess_planning_readiness(
+        self,
+        goal: str,
+        conversation: list[dict],
+        agents: list[dict],
+        memory_context: str = "",
+        privacy_ctx: PrivacyContext | None = None,
+    ) -> dict:
+        """
+        After one or more clarification rounds, decide whether the combined
+        goal + conversation supplies enough information for a fully executable plan.
+
+        conversation — ordered list of {"role": "assistant"|"user", "content": str}
+        turns representing all prior Q&A rounds for this goal.
+
+        Returns {"ready": bool, "follow_up_questions": list[str], "understood_as": str}.
+        Fails open (ready=True) so a transient LLM error never blocks execution.
+        """
+        caps_text = self._format_capabilities(agents, goal=goal, compact=True)
+        compact_memory = self._compact_memory_context(memory_context)
+        memory_section = (
+            f"\nConfirmed user facts (do NOT re-ask):\n{compact_memory}\n"
+            if compact_memory else ""
+        )
+        turns_text = "\n".join(
+            f"{'Planner' if t['role'] == 'assistant' else 'User'}: {t['content']}"
+            for t in conversation
+        )
+        try:
+            raw = await self._proxy_complete(
+                messages=[{"role": "user", "content": (
+                    f"Goal: {goal}\n"
+                    f"{memory_section}"
+                    f"\nConversation so far:\n{turns_text}\n\n"
+                    f"Available capabilities:\n{caps_text}"
+                )}],
+                system=_READINESS_SYSTEM_PROMPT,
+                max_tokens=256,
+                model=self._model_fast or self._model,
+                privacy_ctx=privacy_ctx,
+            )
+            logger.debug("Planning readiness response: %s", raw[:200])
+            return self._extract_json(raw)
+        except Exception as exc:
+            logger.warning("assess_planning_readiness failed (fail open): %s", exc)
+            return {"ready": True}
 
     async def answer_followup_from_memory(
         self,
@@ -1065,6 +1180,8 @@ class TaskPlanner:
                     },
                 ],
                 privacy_ctx=privacy_ctx,
+                # Memory lookup is a simple retrieval task — use fast model if configured.
+                model=self._model_fast or self._model,
             )
             parsed = self._extract_json(raw)
             found = bool(parsed.get("found"))
@@ -1154,7 +1271,12 @@ class TaskPlanner:
         return score
 
     def _select_capabilities(self, agents: list[dict], goal: str, limit: int = _COMPACT_CAP_LIMIT) -> list[dict]:
-        all_caps = self._flatten_capabilities(agents)
+        return self._rank_and_select(self._flatten_capabilities(agents), goal, limit)
+
+    def _rank_and_select(self, all_caps: list[dict], goal: str, limit: int = _COMPACT_CAP_LIMIT) -> list[dict]:
+        """Rank an already-flattened capability list by goal relevance and return
+        the top *limit*, always pinning a messaging channel (and the scheduler
+        when the goal is time-based) so plans can still complete."""
         if len(all_caps) <= limit:
             return all_caps
 
@@ -1190,6 +1312,17 @@ class TaskPlanner:
                     _add(cap)
                     break
 
+        # Pin the top-ranked capability from any agent explicitly named in the goal.
+        # This prevents e.g. "use heygen to create a video" from pushing create_video
+        # into the names-only tail because many heygen caps split the relevance score.
+        # Match by checking whether any goal token is a prefix-word of the agent name
+        # (e.g. goal token "heygen" matches agent "heygen-agent").
+        for cap in ranked:
+            agent_words = set(re.split(r"[^a-z0-9]+", cap["agent_name"].lower()))
+            if agent_words & goal_tokens:
+                _add(cap)
+                break
+
         for cap in ranked:
             if len(selected) >= limit:
                 break
@@ -1197,19 +1330,77 @@ class TaskPlanner:
         return selected[:limit]
 
     def _format_capabilities(self, agents: list[dict], goal: str = "", compact: bool = False) -> str:
-        caps = self._select_capabilities(agents, goal) if compact else self._flatten_capabilities(agents)
-        if not caps:
+        all_caps = self._flatten_capabilities(agents)
+        if not all_caps:
             return "  (no agents currently available)"
         if compact:
-            return self._format_caps_compact(caps)
-        return self._format_caps_verbose(caps)
+            return self._format_caps_tiered(all_caps, goal)
+        return self._format_caps_verbose(all_caps)
+
+    def _format_caps_tiered(self, all_caps: list[dict], goal: str, detail_limit: int = _COMPACT_CAP_LIMIT) -> str:
+        """Progressive disclosure: keep **every** capability visible, but spend
+        full-schema tokens only on the goal-relevant ones.  The remainder are
+        listed name-only (grouped by agent) so the planner still knows they
+        exist and can surface them via tool-discovery / re-ranking, without
+        paying full field-schema cost for each.
+
+        This replaces the old hard top-N drop — nothing is removed from the
+        catalogue, the long tail is just compressed."""
+        if len(all_caps) <= detail_limit:
+            return self._format_caps_compact(all_caps)
+
+        detailed = self._rank_and_select(all_caps, goal, detail_limit)
+        detailed_keys = {(c["agent_name"], c["capability_name"]) for c in detailed}
+        remainder = [
+            c for c in all_caps
+            if (c["agent_name"], c["capability_name"]) not in detailed_keys
+        ]
+
+        parts = [self._format_caps_compact(detailed)]
+        if remainder:
+            from collections import defaultdict
+            by_agent: dict[str, list[str]] = defaultdict(list)
+            for c in remainder:
+                by_agent[c["agent_name"]].append(c["capability_name"])
+            parts.append(
+                "\nMore capabilities available (names only — request full schema if relevant):"
+            )
+            for agent_name, names in by_agent.items():
+                parts.append(f"  [{agent_name}] {', '.join(names)}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _cost_token(cap: dict) -> str:
+        """Compact cost string, or '' for free (free is the default — omit it)."""
+        cost_usd = cap.get("cost_usd")
+        return f"${cost_usd:.4f}" if cost_usd else ""
+
+    @staticmethod
+    def _trim_desc(desc: str, max_chars: int = 90) -> str:
+        """Strip boilerplate openers ('Use this to…') and cap length."""
+        desc = _DESC_PREFIX_RE.sub("", (desc or "").strip())
+        if desc:
+            desc = desc[0].upper() + desc[1:]
+        return desc[:max_chars]
 
     def _format_caps_compact(self, caps: list[dict]) -> str:
         """
-        Single-line-per-capability format grouped by agent. ~60% fewer tokens than verbose.
+        Dense single-line-per-capability format grouped by agent.
+
+        Token-reduction strategies (lossless for planning):
+          • Agent-level factoring — a cost or path-constraint shared by every
+            capability in an agent is hoisted to the agent header instead of
+            being repeated on each line.
+          • Drop-inferred — `free` cost is omitted entirely, string field types
+            are omitted (string is the modal type), and optional fields collapse
+            to a `+Nopt` count rather than being listed.
+          • Required fields carry a `!` suffix; optional fields listed by name without `!`.
+          • Non-string types carry a 1-char code (i=int, b=bool, a=array, o=object).
+
         Example:
-          [browser-agent]
-            browse_web (free): Navigate the web to complete a task. → task(str,REQ)
+          [filesystem-agent | paths⊂/workspace]
+            read_file: Read a file's contents → path!
+            write_file: Create or overwrite a file → path! content! encoding
         """
         from collections import defaultdict
         by_agent: dict[str, list[dict]] = defaultdict(list)
@@ -1218,41 +1409,50 @@ class TaskPlanner:
 
         lines: list[str] = []
         for agent_name, agent_caps in by_agent.items():
-            lines.append(f"[{agent_name}]")
+            # ── Strategy 2: hoist uniform cost / path-constraint to header ──
+            costs = {self._cost_token(c) for c in agent_caps}
+            shared_cost = costs.pop() if len(costs) == 1 else None
+
+            path_sets = {tuple(c.get("path_constraint") or ()) for c in agent_caps}
+            shared_paths = path_sets.pop() if len(path_sets) == 1 else ()
+
+            header = f"[{agent_name}"
+            if shared_cost:
+                header += f" | {shared_cost}"
+            if shared_paths:
+                header += f" | paths⊂{', '.join(str(p) for p in shared_paths)}"
+            header += "]"
+            lines.append(header)
+
             for cap in agent_caps:
                 cap_name = cap["capability_name"]
-                desc = (cap.get("description") or "")[:100]
-                cost_usd = cap.get("cost_usd")
-                cost_str = f"${cost_usd:.4f}" if cost_usd else "free"
+                desc = self._trim_desc(cap.get("description") or "")
+                properties = cap.get("properties", {})
                 required = cap.get("required_fields", [])
                 optional = cap.get("optional_fields", [])
-                properties = cap.get("properties", {})
 
-                field_parts: list[str] = []
-                for f in required:
-                    raw_type = (properties.get(f) or {}).get("type", "")
-                    if isinstance(raw_type, list):
-                        raw_type = raw_type[0] if raw_type else ""
-                    ftype = _TYPE_ABBREV.get(raw_type, "any")
-                    field_parts.append(f"{f}({ftype},REQ)")
-                for f in optional[:_MAX_OPTIONAL_FIELDS_PER_CAP]:
-                    raw_type = (properties.get(f) or {}).get("type", "")
-                    if isinstance(raw_type, list):
-                        raw_type = raw_type[0] if raw_type else ""
-                    ftype = _TYPE_ABBREV.get(raw_type, "any")
-                    field_parts.append(f"{f}({ftype})")
+                # Required fields carry `!`; optional fields listed by name (no `!`).
+                field_parts = [_micro_field(f, properties, True) for f in required]
+                field_parts += [_micro_field(f, properties, False) for f in optional]
 
-                line = f"  {cap_name} ({cost_str})"
+                line = f"  {cap_name}"
+                # Per-cap cost only when not already factored to the header.
+                if shared_cost is None:
+                    tok = self._cost_token(cap)
+                    if tok:
+                        line += f" ({tok})"
                 if desc:
                     line += f": {desc}"
                 if field_parts:
                     line += f" → {', '.join(field_parts)}"
                 lines.append(line)
 
-                path_constraint = cap.get("path_constraint")
-                if path_constraint:
-                    roots_str = ", ".join(str(p) for p in path_constraint)
-                    lines.append(f"    [paths must be within: {roots_str}]")
+                # Per-cap path constraint only when not factored to the header.
+                if not shared_paths:
+                    pc = cap.get("path_constraint")
+                    if pc:
+                        roots_str = ", ".join(str(p) for p in pc)
+                        lines.append(f"    [paths⊂{roots_str}]")
         return "\n".join(lines)
 
     def _format_caps_verbose(self, caps: list[dict]) -> str:
@@ -1309,13 +1509,79 @@ class TaskPlanner:
             return text[: max_chars - 16] + "... (truncated)"
         return "\n".join(keep) + "\n... (truncated)"
 
+    @staticmethod
+    def _strip_thinking_blocks(text: str) -> str:
+        """Remove <think>…</think> reasoning blocks (Qwen3, DeepSeek-R1, etc.)."""
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
     def _extract_json(self, text: str) -> dict:
+        # Strip Qwen3-style <think>…</think> reasoning blocks.  These often
+        # contain partial JSON / braces which break the greedy \{.*\} regex.
+        text = self._strip_thinking_blocks(text)
+
+        # 0. Try the whole text as bare JSON first — handles models that return
+        #    a clean JSON block with no surrounding prose.  This is also the only
+        #    safe path when the response is a nested structure: the reverse-scan
+        #    below would otherwise return an inner object (e.g. a step's
+        #    input_data dict) instead of the outer plan object.
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            try:
+                result = json.loads(stripped)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+        # 1. Fenced code block  ```json … ```
         m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if m:
             return json.loads(m.group(1))
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            return json.loads(m.group(0))
+
+        # 2. Forward scan: find the first `{` and walk to its matching `}`.
+        #    Most prose-prefix responses look like "Here is the plan:\n{...}"
+        #    where the first `{` IS the outer plan object.
+        candidates = list(re.finditer(r"\{", text))
+        for start_match in candidates:
+            start = start_match.start()
+            depth = 0
+            for i, ch in enumerate(text[start:], start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            result = json.loads(candidate)
+                            if isinstance(result, dict):
+                                return result
+                        except json.JSONDecodeError:
+                            break
+
+        # 3. Reverse scan: last-resort for responses where the model sandwiched
+        #    the JSON between two blocks of prose (start AND end have prose).
+        for start_match in reversed(candidates):
+            start = start_match.start()
+            depth = 0
+            for i, ch in enumerate(text[start:], start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            result = json.loads(candidate)
+                            if isinstance(result, dict) and (
+                                "steps" in result or "title" in result
+                                or "needs_clarification" in result
+                                or "ready" in result or "found" in result
+                            ):
+                                return result
+                        except json.JSONDecodeError:
+                            break
+
         raise ValueError(f"No JSON found in LLM response: {text[:300]!r}")
 
     @staticmethod
@@ -1384,6 +1650,118 @@ class TaskPlanner:
                 input_data["scheduled_at"],
             )
 
+    async def refine_plan(
+        self,
+        plan_dict: dict,
+        instruction: str,
+        privacy_ctx: PrivacyContext | None = None,
+    ) -> dict:
+        """
+        Revise an existing plan according to *instruction* with a single LLM call.
+        Returns a normalised plan dict {title, description, goal, steps, total_steps}
+        with fresh step_ids. Nothing is persisted or executed.
+        """
+        now_utc = datetime.now(timezone.utc)
+        agents = await self.discover_capabilities()
+        goal = str(plan_dict.get("goal", "") or plan_dict.get("title", ""))
+        caps_text = self._format_capabilities(
+            agents, goal=f"{goal} {instruction}", compact=True
+        )
+
+        current_plan_json = json.dumps(
+            {
+                "title":       plan_dict.get("title", ""),
+                "description": plan_dict.get("description", ""),
+                "goal":        goal,
+                "steps": [
+                    {
+                        "name":           s.get("name", ""),
+                        "goal":           s.get("goal", ""),
+                        "description":    s.get("description", ""),
+                        "capability":     s.get("capability", ""),
+                        "input_data":     s.get("input_data", {}),
+                        "depends_on":     s.get("depends_on", []),
+                        "execution_mode": s.get("execution_mode", "strict"),
+                    }
+                    for s in plan_dict.get("steps", [])
+                    if isinstance(s, dict)
+                ],
+            },
+            indent=2,
+        )
+
+        user_msg = (
+            f"CURRENT_UTC: {self._iso_utc(now_utc)}\n\n"
+            f"Here is an existing workflow plan:\n```json\n{current_plan_json}\n```\n\n"
+            f"Revise it according to this instruction:\n{instruction}\n\n"
+            "Return the COMPLETE revised plan in the same JSON format you use for "
+            "new plans (title, description, steps). Keep steps that the instruction "
+            "does not affect unchanged. Only use capabilities from the available "
+            "capabilities list. Do not add memory_entries."
+        )
+
+        logger.info(
+            "Refining plan: title=%r  instruction=%r",
+            plan_dict.get("title", "")[:60], instruction[:80],
+        )
+        raw_text: str = await self._proxy_complete(
+            messages=[],
+            system="",
+            max_tokens=self._max_tokens,
+            segments=[
+                {
+                    "name": "system_prompt",
+                    "type": "system",
+                    "content": self._plan_system_prompt,
+                    "cacheable": True,
+                },
+                {
+                    "name": "capabilities",
+                    "type": "context",
+                    "content": f"Available agent capabilities:\n{caps_text}",
+                    "cacheable": True,
+                },
+                {
+                    "name": "conversation",
+                    "type": "messages",
+                    "content": [{"role": "user", "content": user_msg}],
+                    "cacheable": False,
+                },
+            ],
+            privacy_ctx=privacy_ctx,
+            model=self._model_plan or self._model,
+        )
+
+        revised = self._extract_json(raw_text)
+        self._normalise_schedule_times(revised, now_utc)
+        revised.pop("memory_entries", None)
+
+        steps: list[dict] = []
+        for i, step_d in enumerate(revised.get("steps", []), 1):
+            if not isinstance(step_d, dict):
+                continue
+            raw_mode = str(step_d.get("execution_mode", "")).strip().lower()
+            steps.append(
+                WorkflowStep.create(
+                    order=i,
+                    name=step_d.get("name", f"Step {i}"),
+                    goal=step_d.get("goal", step_d.get("description", "")),
+                    description=step_d.get("description", ""),
+                    capability=step_d.get("capability", ""),
+                    input_data=step_d.get("input_data", {}),
+                    depends_on=step_d.get("depends_on") or [],
+                    execution_mode=raw_mode if raw_mode in ("strict", "emergent") else "strict",
+                ).to_dict()
+            )
+
+        return {
+            "title":       revised.get("title", plan_dict.get("title", "")),
+            "description": revised.get("description", plan_dict.get("description", "")),
+            "goal":        revised.get("goal", goal),
+            "steps":       steps,
+            "total_steps": len(steps),
+        }
+
     async def plan(
         self,
         goal: str,
@@ -1398,6 +1776,7 @@ class TaskPlanner:
         memory_context: str = "",
         clarification_message: str = "",
         clarification_answers: str = "",
+        clarification_history: list[dict] | None = None,
         session_history: list[dict] | None = None,
         privacy_ctx: PrivacyContext | None = None,
     ) -> WorkflowPlan:
@@ -1410,11 +1789,11 @@ class TaskPlanner:
         user_id is used to fetch/write Cortex user memory for personalisation.
         memory_context: pass a pre-fetched value to skip an extra Cortex fetch
         (e.g. when the caller already fetched it for the clarification check).
-        clarification_message: the text that was sent to the user asking for
-        clarification. When provided together with clarification_answers, the
-        LLM call uses a multi-turn conversation history so it sees the full
-        back-and-forth context rather than a flattened string.
-        clarification_answers: the user's reply to the clarification questions.
+        clarification_message / clarification_answers: single-round Q&A (legacy).
+        clarification_history: ordered list of {"role": "assistant"|"user",
+            "content": str} turns covering all clarification rounds. When provided
+            it supersedes clarification_message/answers and builds a complete
+            multi-turn conversation so the LLM sees the full back-and-forth.
         """
         # ── Skill replay: check for a matching past plan before any LLM call ──
         # Only attempted when skill_learning_enabled=true and there are no
@@ -1509,8 +1888,14 @@ class TaskPlanner:
                 "Planning workflow: goal=%r  mode=tool-discovery  memory=%s",
                 goal[:80], "yes" if memory_context else "none",
             )
-            if clarification_message and clarification_answers:
-                # Inject clarification exchange into user message
+            if clarification_history:
+                # Multi-round: flatten the full conversation into the user message
+                turns_text = "\n".join(
+                    f"{'Planner' if t['role'] == 'assistant' else 'User'}: {t['content']}"
+                    for t in clarification_history
+                )
+                user_msg += f"\n\nClarification dialogue:\n{turns_text}"
+            elif clarification_message and clarification_answers:
                 user_msg += (
                     f"\n\nClarification Q: {clarification_message}\n"
                     f"User answered: {clarification_answers}"
@@ -1560,13 +1945,21 @@ class TaskPlanner:
             )
 
             # ── Single LLM call with pre-fetched capabilities ─────────────────
-            if clarification_message and clarification_answers:
+            if clarification_history:
+                # Multi-round conversational path: prepend the initial goal message
+                # and append all clarification turns so the LLM sees the full dialogue.
+                conv_messages = [{"role": "user", "content": user_msg}] + clarification_history
+                logger.info(
+                    "Planning with multi-round clarification history (%d turns)",
+                    len(clarification_history),
+                )
+            elif clarification_message and clarification_answers:
                 conv_messages = [
                     {"role": "user", "content": user_msg},
                     {"role": "assistant", "content": clarification_message},
                     {"role": "user", "content": clarification_answers},
                 ]
-                logger.info("Planning with multi-turn conversation history (3 turns)")
+                logger.info("Planning with single-round clarification history (3 turns)")
             elif clarification_answers:
                 user_msg += (
                     f"\n\nThe user provided these answers to clarification questions:\n"
@@ -1602,6 +1995,9 @@ class TaskPlanner:
                     },
                 ],
                 privacy_ctx=privacy_ctx,
+                # Plan generation is the most reasoning-heavy task — use the
+                # powerful plan model if configured, else fall back to _model.
+                model=self._model_plan or self._model,
             )
             logger.debug("LLM response: %s", raw_text[:500])
 

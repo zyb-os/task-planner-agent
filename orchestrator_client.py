@@ -69,55 +69,176 @@ def _stable_agent_id() -> str:
 _REF_RE = re.compile(r"\{\{steps\[(\d+)\]\.output(?:\.([^}]+))?\}\}")
 _ARRAY_KEY_RE = re.compile(r"^([^\[]+)\[(\d+)\]$")
 
+# Sentinel distinguishing "key absent" from "key present with value None".
+# node.get(key) conflates the two, which is how missing fields used to be
+# silently dispatched downstream as None.
+_MISSING = object()
+
+
+class StepRefError(ValueError):
+    """
+    A ``{{steps[N].output...}}`` reference could not be resolved.
+
+    Carries *producing_step* (the 0-indexed step whose output was referenced) so
+    the failure is reported against the step that actually produced the wrong
+    shape, not the step that happened to consume it.
+    """
+
+    def __init__(self, message: str, ref: str, producing_step: Optional[int]) -> None:
+        super().__init__(message)
+        self.ref = ref
+        self.producing_step = producing_step
+
+
+def _describe(node: Any) -> str:
+    """Short human-readable description of what a node actually is."""
+    if isinstance(node, dict):
+        keys = list(node.keys())
+        shown = ", ".join(repr(k) for k in keys[:8])
+        more = f", …(+{len(keys) - 8} more)" if len(keys) > 8 else ""
+        return f"an object with keys [{shown}{more}]" if keys else "an empty object"
+    if isinstance(node, list):
+        return f"a list of {len(node)} item(s)"
+    return f"{type(node).__name__} ({node!r:.40})"
+
 
 def _traverse(node: Any, key: str) -> Any:
-    """Traverse one path segment; supports array indexing like ``results[0]``."""
+    """
+    Traverse one path segment; supports array indexing like ``results[0]``.
+
+    Returns ``_MISSING`` when the segment cannot be resolved, so callers can tell
+    a genuinely-null value apart from an absent one.
+    """
     m = _ARRAY_KEY_RE.match(key)
     if m:
         dict_key, arr_idx = m.group(1), int(m.group(2))
-        node = node.get(dict_key) if isinstance(node, dict) else None
+        if not isinstance(node, dict) or dict_key not in node:
+            return _MISSING
+        node = node[dict_key]
         if isinstance(node, list) and arr_idx < len(node):
             return node[arr_idx]
-        return None
-    return node.get(key) if isinstance(node, dict) else None
+        return _MISSING
+    if not isinstance(node, dict) or key not in node:
+        return _MISSING
+    return node[key]
 
 
-def _resolve_step_refs(value: Any, outputs: list[Optional[dict]]) -> Any:
+def _lookup_ref(
+    idx: int,
+    path_str: Optional[str],
+    outputs: list[Optional[dict]],
+    ref: str,
+    current_index: Optional[int],
+) -> Any:
+    """
+    Resolve one parsed reference, raising StepRefError with an actionable message
+    on every failure path. Returns the resolved value (which may legitimately be
+    None, a dict, or a list).
+    """
+    if idx >= len(outputs):
+        raise StepRefError(
+            f"{ref} references step {idx + 1}, but the plan has only "
+            f"{len(outputs)} step(s).",
+            ref, None,
+        )
+    if current_index is not None and idx >= current_index:
+        which = "itself" if idx == current_index else f"step {idx + 1}, which runs later"
+        raise StepRefError(
+            f"{ref} references {which}. A step may only reference the output of "
+            f"an earlier step.",
+            ref, idx,
+        )
+
+    output = outputs[idx]
+    if output is None:
+        raise StepRefError(
+            f"{ref} references step {idx + 1}, but that step produced no output.",
+            ref, idx,
+        )
+
+    if not path_str:
+        return output
+
+    node: Any = output
+    walked: list[str] = []
+    for key in path_str.split("."):
+        nxt = _traverse(node, key)
+        if nxt is _MISSING:
+            where = f"step {idx + 1} output" + (
+                "." + ".".join(walked) if walked else ""
+            )
+            raise StepRefError(
+                f"{ref} could not be resolved: {where} has no {key!r} — "
+                f"it is {_describe(node)}.",
+                ref, idx,
+            )
+        walked.append(key)
+        node = nxt
+    return node
+
+
+def _resolve_step_refs(
+    value: Any,
+    outputs: list[Optional[dict]],
+    *,
+    strict: bool = True,
+    current_index: Optional[int] = None,
+) -> Any:
     """Recursively substitute ``{{steps[N].output[.field]}}`` in *value*.
 
     When the field path is omitted (``{{steps[N].output}}``) the whole output
     dict is returned — useful for passing an entire step's output as
     ``input_data.data`` to a ``format_step_output`` step.
+
+    With ``strict=True`` (the default, used for real dispatch) any reference that
+    cannot be resolved raises :class:`StepRefError` instead of silently yielding
+    ``None`` or leaking the literal template text downstream.
+
+    With ``strict=False`` unresolvable references are left as-is — appropriate for
+    best-effort *hints*, such as the seed input handed to the emergent runner,
+    which discovers the real values by observation anyway.
+
+    ``current_index`` (the 0-indexed step being dispatched), when supplied, also
+    rejects self- and forward-references.
     """
 
     def _resolve_str(s: str) -> Any:
         full = _REF_RE.fullmatch(s)
         if full:
-            idx = int(full.group(1))
-            path_str = full.group(2)   # None when no .field path given
-            node: Any = (outputs[idx] or {}) if idx < len(outputs) else {}
-            if path_str:
-                for key in path_str.split("."):
-                    node = _traverse(node, key)
-            return node  # may be a dict/list when path_str is None
+            try:
+                return _lookup_ref(
+                    int(full.group(1)), full.group(2), outputs, full.group(0), current_index
+                )
+            except StepRefError:
+                if strict:
+                    raise
+                return s
 
         def _sub(m: re.Match) -> str:
-            idx = int(m.group(1))
-            path_str = m.group(2)
-            node: Any = (outputs[idx] or {}) if idx < len(outputs) else {}
-            if path_str:
-                for key in path_str.split("."):
-                    node = _traverse(node, key)
-            return str(node) if node is not None else m.group(0)
+            try:
+                node = _lookup_ref(
+                    int(m.group(1)), m.group(2), outputs, m.group(0), current_index
+                )
+            except StepRefError:
+                if strict:
+                    raise
+                return m.group(0)
+            return "" if node is None else str(node)
 
         return _REF_RE.sub(_sub, s)
 
     if isinstance(value, str):
         return _resolve_str(value)
     if isinstance(value, dict):
-        return {k: _resolve_step_refs(v, outputs) for k, v in value.items()}
+        return {
+            k: _resolve_step_refs(v, outputs, strict=strict, current_index=current_index)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_resolve_step_refs(v, outputs) for v in value]
+        return [
+            _resolve_step_refs(v, outputs, strict=strict, current_index=current_index)
+            for v in value
+        ]
     return value
 
 
@@ -302,6 +423,13 @@ REGISTRATION_PAYLOAD: dict = {
                         "type": "string",
                         "description": "Optional format instructions for summaries (e.g. bullets with action items).",
                     },
+                    "plan_only": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, generate and return the full plan (steps included) "
+                            "as a draft without executing it. Used to author saved workflows."
+                        ),
+                    },
                 },
                 "required": ["goal"],
             },
@@ -404,6 +532,90 @@ REGISTRATION_PAYLOAD: dict = {
             },
             "tags": ["formatting", "slack", "template"],
             "cost": {"type": "free", "estimated_cost_usd": None, "notes": "Local Jinja2 render"},
+        },
+        {
+            "name": "refine_plan",
+            "description": (
+                "Revise an existing workflow plan according to a natural-language "
+                "instruction (add/remove/change steps, adjust inputs). Returns the "
+                "complete revised plan JSON without saving or executing it."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "description": "The current plan object: {title, description, goal, steps[]}.",
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "What to change, in plain English.",
+                    },
+                },
+                "required": ["plan", "instruction"],
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "title":       {"type": "string"},
+                    "description": {"type": "string"},
+                    "goal":        {"type": "string"},
+                    "steps":       {"type": "array"},
+                    "total_steps": {"type": "integer"},
+                },
+            },
+            "tags": ["planning", "llm", "workflow", "refine"],
+            "cost": {"type": "per_call", "estimated_cost_usd": 0.003, "notes": "One LLM call per refinement"},
+        },
+        {
+            "name": "execute_saved_workflow",
+            "description": (
+                "Run/trigger a saved workflow from the orchestrator's workflow library. "
+                "Identify it by workflow_name (e.g. 'morning report') or workflow_id, "
+                "or pass the plan inline. Use this when the user asks to run, trigger, "
+                "or execute a saved/named workflow."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "ID of the saved workflow to run.",
+                    },
+                    "workflow_name": {
+                        "type": "string",
+                        "description": "Name of the saved workflow to run (case-insensitive match).",
+                    },
+                    "plan": {
+                        "type": "object",
+                        "description": "Optional inline plan {title, description, goal, steps[]} — skips the library lookup.",
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel to deliver the completion summary to.",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Conversation thread to reply into on completion.",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User id for personalisation and DM fallback delivery.",
+                    },
+                },
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "task_id":     {"type": "string"},
+                    "title":       {"type": "string"},
+                    "total_steps": {"type": "integer"},
+                    "status":      {"type": "string"},
+                    "saved_workflow_id": {"type": "string"},
+                },
+            },
+            "tags": ["workflow", "trigger", "saved", "run"],
+            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "Dispatches stored plan; no LLM call"},
         },
     ],
     "tags": ["planner", "llm", "workflow", "orchestration"],
@@ -521,6 +733,15 @@ DRAIN_TIMEOUT_S:        int   = 30
 STEP_TIMEOUT_S:         float = 300.0   # 5 min per step
 DISCOVERY_CACHE_TTL_S:  float = 30.0   # cache best-agent per capability
 MAX_REPLAN_ATTEMPTS:    int   = 3
+MAX_CONV_ROUNDS:        int   = 3       # max clarification dialogue rounds before forcing planning
+
+# Capability names that are meta-operations (planner-internal) and should never
+# appear as executable workflow steps.  If the LLM emits one, preflight converts
+# the step to emergent so the runner can resolve it dynamically.
+_META_CAPABILITIES: frozenset = frozenset({
+    "forge_skill", "forge_agent", "acquire_capability",
+    "install_skill", "create_skill", "write_skill",
+})
 
 # Capabilities that deliver the final result directly to the user.
 # Outcome validation runs before these steps so the message is honest.
@@ -536,6 +757,23 @@ _NOTIFICATION_CAPABILITIES: frozenset = frozenset({
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _parse_clarification_state(pending: dict) -> tuple[int, list[dict]]:
+    """Return (round_number, conversation_history) from a pending_clarification row.
+
+    The ``questions`` column stores either a plain JSON list (legacy round-1 records)
+    or a versioned dict ``{"_v": 2, "round": N, "questions": [...], "history": [...]}``.
+    Both formats are handled transparently so old rows kept working after the upgrade.
+    """
+    raw = pending.get("questions", "[]")
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed.get("_v") == 2:
+            return int(parsed.get("round", 1)), list(parsed.get("history", []))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return 1, []
 
 
 def _envelope(
@@ -856,6 +1094,7 @@ class OrchestratorClient:
             self._common_settings.update(settings)
             for k in (
                 "planner_model", "planner_provider",
+                "planner_model_fast", "planner_model_plan",
                 "planner_max_replan_attempts",
                 "planner_hybrid_execution",
                 "planner_emergent_max_turns",
@@ -929,6 +1168,12 @@ class OrchestratorClient:
                 output, error = await self._cap_list_workflows(input_data)
             elif capability == "format_step_output":
                 output, error = await self._cap_format_step_output(input_data)
+            elif capability == "refine_plan":
+                output, error = await self._cap_refine_plan(input_data)
+            elif capability == "execute_saved_workflow":
+                output, error = await self._cap_execute_saved_workflow(
+                    input_data, sender_id, ws
+                )
             else:
                 output, error = None, f"Unknown capability: {capability!r}"
 
@@ -1014,6 +1259,13 @@ class OrchestratorClient:
         if not self._planner:
             return None, "Planner not initialised"
 
+        # plan_only / auto_execute=false → generate and persist a draft plan,
+        # return the full steps JSON, and never dispatch execution. Used by the
+        # dashboard Workflow Library to build saved workflows.
+        plan_only = bool(input_data.get("plan_only")) or (
+            input_data.get("auto_execute") is False
+        )
+
         # Step -1: check if this is a reply to a pending agent follow-up question
         if thread_id and channel_id:
             pending_followup = await asyncio.to_thread(
@@ -1095,19 +1347,26 @@ class OrchestratorClient:
             pending = await asyncio.to_thread(
                 self._store.get_latest_pending_clarification, channel_id
             )
+        # Multi-round state restored from the pending record.
+        # round_number: which dialogue round this reply closes (1-based).
+        # conv_history:  all prior assistant+user turns from previous rounds.
+        round_number: int = 1
+        conv_history: list[dict] = []
+
         if pending:
             logger.info("Clarification reply received (thread=%s)", (thread_id or "")[:12])
-            # Restore the original goal; keep the user's reply as answers
-            # so plan() can build a proper multi-turn conversation history.
             effective_goal = pending['goal']
-            clarification_answers = goal  # the user's answers to the questions
+            clarification_answers = goal  # user's reply text
+
+            # Parse multi-round state from the stored questions field
+            round_number, conv_history = _parse_clarification_state(pending)
 
             clarification_message = pending.get('clarification_message', '')
             if not clarification_message:
-                # Reconstruct from the stored questions list — covers records
-                # created before the clarification_message column was added.
                 try:
                     stored_qs = json.loads(pending.get('questions', '[]'))
+                    if isinstance(stored_qs, dict):
+                        stored_qs = stored_qs.get('questions', [])
                     if stored_qs:
                         q_lines = "\n".join(
                             f"{i+1}. {q}" for i, q in enumerate(stored_qs)
@@ -1118,9 +1377,7 @@ class OrchestratorClient:
                 except (json.JSONDecodeError, TypeError):
                     pass
             if clarification_message:
-                logger.debug(
-                    "Clarification context restored (len=%d)", len(clarification_message)
-                )
+                logger.debug("Clarification context restored (len=%d)", len(clarification_message))
             else:
                 logger.warning(
                     "No clarification_message available — answers will be "
@@ -1132,14 +1389,10 @@ class OrchestratorClient:
             )
 
         # Create a privacy context for this entire plan_task invocation.
-        # The same context is reused across the clarification check, planning, and
-        # any emergent tool-loop steps so placeholder tokens are stable end-to-end.
         privacy_ctx = PrivacyContext()
 
-        # Step 2: if not a reply (effective_goal unchanged) and we can send messages,
-        #         check if clarification is needed — memory context suppresses
-        #         questions whose answers are already known from Cortex.
-        if effective_goal == goal and (channel_id or user_id) and self._planner:
+        # ── Step 2a: fresh request — check if clarification needed ────────────
+        if not plan_only and effective_goal == goal and (channel_id or user_id) and self._planner:
             try:
                 agents = await self._planner.discover_capabilities()
                 clarity = await self._planner.check_needs_clarification(
@@ -1165,10 +1418,14 @@ class OrchestratorClient:
                         )
 
                     clarification_id = str(uuid.uuid4())
+                    # Round 1 — store as the new versioned format from the start
+                    stored_state = json.dumps({
+                        "_v": 2, "round": 1, "questions": questions, "history": [],
+                    })
                     await asyncio.to_thread(
                         self._store.save_pending_clarification,
                         clarification_id, thread_id, channel_id,
-                        requester_id, user_id, goal, json.dumps(questions), msg,
+                        requester_id, user_id, goal, stored_state, msg,
                     )
                     await self._send_clarification_message(
                         channel_id, msg, thread_ts=thread_id, user_id=user_id
@@ -1185,6 +1442,74 @@ class OrchestratorClient:
             except Exception as exc:
                 logger.warning("Clarification check failed — proceeding directly: %s", exc)
 
+        # ── Step 2b: clarification reply — assess readiness before planning ───
+        # Append the just-completed round to conversation history, then ask the
+        # planner whether we now have enough information to produce executable steps.
+        # If not and we haven't hit the round cap, send another targeted question.
+        clarification_history: list[dict] | None = None
+        if pending and not plan_only and (channel_id or user_id) and self._planner:
+            # Grow the conversation history with this round's exchange
+            if clarification_message:
+                conv_history.append({"role": "assistant", "content": clarification_message})
+            conv_history.append({"role": "user", "content": clarification_answers})
+
+            if round_number < MAX_CONV_ROUNDS:
+                try:
+                    agents = await self._planner.discover_capabilities()
+                    readiness = await self._planner.assess_planning_readiness(
+                        goal=effective_goal,
+                        conversation=conv_history,
+                        agents=agents,
+                        memory_context=memory_context,
+                        privacy_ctx=privacy_ctx,
+                    )
+                    if not readiness.get("ready") and readiness.get("follow_up_questions"):
+                        follow_qs: list[str] = readiness["follow_up_questions"][:2]
+                        understood_as = readiness.get("understood_as", "")
+                        q_lines = "\n".join(f"{i+1}. {q}" for i, q in enumerate(follow_qs))
+                        if understood_as:
+                            msg = (
+                                f"Thanks — I understand: _{understood_as}_\n\n"
+                                f"A couple more things:\n{q_lines}\n\n"
+                                "_Please reply in this thread._"
+                            )
+                        else:
+                            msg = (
+                                f"A couple more things:\n{q_lines}\n\n"
+                                "_Please reply in this thread._"
+                            )
+
+                        new_state = json.dumps({
+                            "_v": 2,
+                            "round": round_number + 1,
+                            "questions": follow_qs,
+                            "history": conv_history,
+                        })
+                        follow_id = str(uuid.uuid4())
+                        await asyncio.to_thread(
+                            self._store.save_pending_clarification,
+                            follow_id, thread_id, channel_id,
+                            requester_id, user_id, effective_goal, new_state, msg,
+                        )
+                        await self._send_clarification_message(
+                            channel_id, msg, thread_ts=thread_id, user_id=user_id
+                        )
+                        logger.info(
+                            "Conversational planner: round %d/%d (id=%s)",
+                            round_number + 1, MAX_CONV_ROUNDS, follow_id[:8],
+                        )
+                        return {
+                            "task_id": follow_id,
+                            "status":  "awaiting_clarification",
+                            "message": f"Follow-up sent (round {round_number + 1}/{MAX_CONV_ROUNDS})",
+                        }, None
+                except Exception as exc:
+                    logger.warning("Readiness check failed — proceeding to plan: %s", exc)
+
+            # Ready (or cap reached): pass the full dialogue to plan() so the LLM
+            # sees the complete back-and-forth rather than just the final answer.
+            clarification_history = conv_history if conv_history else None
+
         # ── Single LLM call ──────────────────────────────────────────────────
         try:
             plan: WorkflowPlan = await self._planner.plan(
@@ -1196,9 +1521,10 @@ class OrchestratorClient:
                 persona=persona,
                 summary_format=summary_format,
                 source=source,
-                memory_context=memory_context,              # reuse already-fetched context
-                clarification_message=clarification_message,  # "" for fresh requests
-                clarification_answers=clarification_answers,  # "" for fresh requests
+                memory_context=memory_context,
+                clarification_message=clarification_message,
+                clarification_answers=clarification_answers,
+                clarification_history=clarification_history,
                 session_history=session_history,
                 privacy_ctx=privacy_ctx,
             )
@@ -1214,6 +1540,29 @@ class OrchestratorClient:
         _inject_slack_user_id(steps, user_id)
         logger.info("Plan ready: task_id=%s  title=%r  steps=%d",
                     plan.task_id, plan.title, len(steps))
+
+        if plan_only:
+            # Persist for inspection but never dispatch. The caller owns the
+            # plan from here (e.g. saves it as a reusable workflow).
+            await asyncio.to_thread(
+                self._store.create_workflow,
+                plan.task_id, effective_goal, plan.title, plan.description,
+                requester_id, steps,
+                channel_id=channel_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                source=source or "plan_only",
+            )
+            await asyncio.to_thread(self._store.set_status, plan.task_id, "draft")
+            return {
+                "task_id":     plan.task_id,
+                "title":       plan.title,
+                "description": plan.description,
+                "goal":        effective_goal,
+                "steps":       steps,
+                "total_steps": len(steps),
+                "status":      "draft",
+            }, None
 
         # ── Persist user memory entries with sensitive-data consent ───────────
         memory_entries = [
@@ -1310,11 +1659,14 @@ class OrchestratorClient:
                 name=f"plan-summary-{plan.task_id[:8]}",
             )
 
-        # ── Dispatch step 0 (non-blocking) ────────────────────────────────────
+        # ── Preflight: fill capability gaps, then dispatch step 0 ─────────────
+        # Runs proactive skill acquisition for any capability not yet registered,
+        # so the workflow starts with all resolvable gaps filled rather than
+        # discovering them mid-execution.
         if steps:
             asyncio.create_task(
-                self._dispatch_step(ws, plan.task_id, 0),
-                name=f"step-{plan.task_id[:8]}-0",
+                self._preflight_and_dispatch(ws, plan.task_id, steps),
+                name=f"preflight-{plan.task_id[:8]}",
             )
 
         return {
@@ -1324,6 +1676,324 @@ class OrchestratorClient:
             "total_steps": len(steps),
             "status":      "running" if steps else "completed",
         }, None
+
+    # ── Capability: refine_plan ────────────────────────────────────────────────
+
+    async def _cap_refine_plan(
+        self, input_data: dict
+    ) -> tuple[dict | None, str | None]:
+        """Revise an existing plan JSON according to a natural-language instruction."""
+        plan = input_data.get("plan")
+        instruction = _clean_text(input_data.get("instruction"))
+        if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
+            return None, "input_data.plan must be a plan object with a steps array"
+        if not instruction:
+            return None, "input_data.instruction is required"
+        if not self._planner:
+            return None, "Planner not initialised"
+        try:
+            revised = await self._planner.refine_plan(plan, instruction)
+        except Exception as exc:
+            logger.error("Plan refinement failed: %s", exc, exc_info=True)
+            return None, f"Plan refinement failed: {exc}"
+        return revised, None
+
+    # ── Capability: execute_saved_workflow ─────────────────────────────────────
+
+    async def _cap_execute_saved_workflow(
+        self, input_data: dict, requester_id: str, ws
+    ) -> tuple[dict | None, str | None]:
+        """
+        Run a saved workflow plan. The plan can be supplied inline (dashboard
+        Run Now) or resolved by id/name from the orchestrator's saved-workflow
+        store (chat and scheduler triggers).
+        """
+        workflow_id   = _clean_text(input_data.get("workflow_id"))
+        workflow_name = _clean_text(input_data.get("workflow_name"))
+        plan          = input_data.get("plan")
+        channel_id    = _clean_text(input_data.get("channel_id"))
+        thread_id     = _clean_text(input_data.get("thread_id"))
+        user_id       = _clean_text(input_data.get("user_id"))
+        delivery_channel = _clean_text(input_data.get("delivery_channel")).lower()
+
+        saved_id = workflow_id
+        if not (isinstance(plan, dict) and plan.get("steps")):
+            if not workflow_id and not workflow_name:
+                return None, "workflow_id, workflow_name, or an inline plan is required"
+            try:
+                if workflow_id:
+                    resp = await self._http.get(
+                        f"{self._base}/api/v1/saved-workflows/{workflow_id}"
+                    )
+                    resp.raise_for_status()
+                    saved = resp.json()
+                else:
+                    resp = await self._http.get(
+                        f"{self._base}/api/v1/saved-workflows",
+                        params={"name": workflow_name},
+                    )
+                    resp.raise_for_status()
+                    matches = resp.json().get("workflows", [])
+                    if not matches:
+                        return None, f"No saved workflow named {workflow_name!r}"
+                    saved = matches[0]
+            except Exception as exc:
+                return None, f"Could not load saved workflow: {exc}"
+            plan = saved.get("plan") or {}
+            saved_id = saved.get("id", "")
+            if not plan.get("steps"):
+                return None, "Saved workflow has no steps"
+
+        # Fresh step ids per run so correlations never collide across runs;
+        # depends_on references are remapped to the new ids.
+        id_map: dict[str, str] = {}
+        steps: list[dict] = []
+        for i, raw in enumerate(plan.get("steps", []), 1):
+            if not isinstance(raw, dict):
+                continue
+            step = dict(raw)
+            old_id = str(step.get("step_id") or "")
+            new_id = str(uuid.uuid4())
+            if old_id:
+                id_map[old_id] = new_id
+            step["step_id"] = new_id
+            step.setdefault("order", i)
+            step.setdefault("input_data", {})
+            step.setdefault("execution_mode", "strict")
+            steps.append(step)
+        for step in steps:
+            step["depends_on"] = [
+                id_map.get(d, d) for d in (step.get("depends_on") or [])
+            ]
+        if not steps:
+            return None, "Plan contains no valid steps"
+
+        _inject_slack_user_id(steps, user_id)
+
+        task_id = str(uuid.uuid4())
+        title = _clean_text(plan.get("title")) or workflow_name or "Saved workflow"
+        description = _clean_text(plan.get("description"))
+        goal = _clean_text(plan.get("goal")) or title
+
+        await asyncio.to_thread(
+            self._store.create_workflow,
+            task_id, goal, title, description,
+            requester_id, steps,
+            channel_id=channel_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            delivery_channel=delivery_channel,
+            source=f"saved:{saved_id}" if saved_id else "saved:inline",
+        )
+        await asyncio.to_thread(self._store.set_status, task_id, "running")
+
+        await self._emit_workflow_event(ws, {
+            "event":           "workflow_started",
+            "task_id":         task_id,
+            "title":           title,
+            "description":     description,
+            "goal":            goal,
+            "total_steps":     len(steps),
+            "workflow_status": "running",
+        })
+
+        # Best-effort: bump run stats on the orchestrator's saved-workflow record
+        # so scheduler- and chat-triggered runs show up in the Library too.
+        if saved_id:
+            try:
+                await self._http.post(
+                    f"{self._base}/api/v1/saved-workflows/{saved_id}/mark-run",
+                    json={"task_id": task_id},
+                )
+            except Exception as exc:
+                logger.debug("mark-run callback failed (non-fatal): %s", exc)
+
+        asyncio.create_task(
+            self._dispatch_step(ws, task_id, 0),
+            name=f"step-{task_id[:8]}-0",
+        )
+
+        return {
+            "task_id":     task_id,
+            "title":       title,
+            "total_steps": len(steps),
+            "status":      "running",
+            "saved_workflow_id": saved_id,
+        }, None
+
+    # ── Preflight skill acquisition ────────────────────────────────────────────
+
+    async def _preflight_and_dispatch(self, ws, task_id: str, steps: list[dict]) -> None:
+        """Run preflight skill acquisition, then kick off step 0."""
+        try:
+            await self._preflight_skill_acquisition(ws, task_id, steps)
+        except Exception as exc:
+            logger.warning("Preflight failed (non-fatal) — proceeding: %s", exc)
+        asyncio.create_task(
+            self._dispatch_step(ws, task_id, 0),
+            name=f"step-{task_id[:8]}-0",
+        )
+
+    async def _preflight_skill_acquisition(
+        self, ws, task_id: str, steps: list[dict]
+    ) -> None:
+        """
+        Before execution begins, scan every planned step for capability gaps and
+        attempt to fill them by contacting the skill-loader-agent (remote registry
+        search + install) or falling back to the skill-forge-agent (generate a new
+        agent from scratch).
+
+        Steps that are still unresolvable after both attempts are converted to
+        ``execution_mode=emergent`` so the agentic runner can handle them at
+        runtime rather than failing hard.
+
+        Steps with a meta-capability name (``forge_skill``, ``install_skill``, etc.)
+        are always converted to emergent — they should never appear in a real plan
+        and the emergent runner is better placed to decide what to do.
+        """
+        # Collect unique capability gaps (deduplicated — only one acquisition
+        # attempt per capability regardless of how many steps reference it).
+        seen: set[str] = set()
+        gaps: list[tuple[int, str]] = []
+        for i, step in enumerate(steps):
+            cap = step.get("capability", "")
+            if not cap or cap in seen:
+                continue
+            seen.add(cap)
+            if cap in _META_CAPABILITIES:
+                gaps.append((i, cap))
+                continue
+            agent_id = await self._discover_best(cap)
+            if not agent_id:
+                gaps.append((i, cap))
+
+        if not gaps:
+            return
+
+        logger.info(
+            "Preflight: %d capability gap(s) for workflow %s: %s",
+            len(gaps), task_id[:8],
+            ", ".join(c for _, c in gaps),
+        )
+
+        for step_index, capability in gaps:
+            if capability in _META_CAPABILITIES:
+                logger.info(
+                    "Preflight: step %d has meta-capability %r — converting to emergent",
+                    step_index + 1, capability,
+                )
+                await asyncio.to_thread(
+                    self._store.patch_step, task_id, step_index,
+                    {"execution_mode": "emergent"},
+                )
+                continue
+
+            # Try skill-loader-agent first (searches remote registry, installs)
+            acquired = await self._try_acquire_skill(capability, task_id, step_index)
+            if acquired:
+                self._discovery_cache.pop(capability, None)
+                logger.info(
+                    "Preflight: skill acquired via loader for %r (step %d)",
+                    capability, step_index + 1,
+                )
+                continue
+
+            # Fallback: ask skill-forge-agent to generate an agent from scratch
+            forged = await self._try_forge_skill(capability, task_id, step_index)
+            if forged:
+                self._discovery_cache.pop(capability, None)
+                logger.info(
+                    "Preflight: skill forged for %r (step %d)",
+                    capability, step_index + 1,
+                )
+                continue
+
+            # Neither path worked — downgrade to emergent for runtime resolution
+            logger.warning(
+                "Preflight: no agent for %r after acquisition — "
+                "step %d converted to emergent",
+                capability, step_index + 1,
+            )
+            await asyncio.to_thread(
+                self._store.patch_step, task_id, step_index,
+                {"_skill_acquisition_attempted": True, "execution_mode": "emergent"},
+            )
+
+    async def _try_forge_skill(
+        self, capability: str, task_id: str, step_index: int
+    ) -> bool:
+        """
+        Ask the skill-forge-agent to generate and deploy a new agent that exposes
+        *capability*.  Returns True when the agent is registered and reachable.
+
+        This is a last-resort fallback after skill-loader-agent fails to find an
+        existing skill in the remote registry.  Forge can take several minutes
+        (LLM code-gen + pip install + subprocess start + orchestrator registration).
+        """
+        forge_agent_id = await self._discover_best("forge_skill")
+        if not forge_agent_id:
+            logger.debug("No skill-forge-agent available — skipping forge for %r", capability)
+            return False
+
+        ws_ref = self._current_ws
+        if ws_ref is None:
+            return False
+
+        logger.info(
+            "Workflow %s step %d: requesting forge for capability %r …",
+            task_id[:8], step_index + 1, capability,
+        )
+
+        req_id = str(uuid.uuid4())
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_responses[req_id] = fut
+
+        try:
+            await self._ws_send(ws_ref, _envelope(
+                sender_id=self._agent_id,
+                msg_type="task_request",
+                payload={
+                    "capability": "forge_skill",
+                    "input_data": {
+                        "goal": (
+                            f"Create an agent that provides the '{capability}' capability. "
+                            f"The capability must be registered with the orchestrator so "
+                            f"it can be discovered via the '{capability}' capability key."
+                        ),
+                        "capability_name": capability,
+                    },
+                },
+                recipient_id=forge_agent_id,
+                msg_id=req_id,
+            ))
+            # Forge: LLM code-gen + pip install + subprocess + registration
+            result = await asyncio.wait_for(fut, timeout=300.0)
+        except asyncio.TimeoutError:
+            logger.warning("skill-forge timed out for %r", capability)
+            self._pending_responses.pop(req_id, None)
+            return False
+        except Exception as exc:
+            logger.warning("_try_forge_skill failed: %s", exc)
+            self._pending_responses.pop(req_id, None)
+            return False
+
+        if not result.get("success"):
+            logger.warning(
+                "skill-forge failed for %r: %s",
+                capability, result.get("error"),
+            )
+            return False
+
+        output = result.get("output_data") or {}
+        registered = bool(output.get("registered") or output.get("success") or output.get("agent_id"))
+        if registered:
+            logger.info("Skill forged and registered for capability %r", capability)
+        else:
+            logger.warning(
+                "skill-forge returned success but agent not confirmed registered for %r: %s",
+                capability, output,
+            )
+        return registered
 
     # ── Step dispatch ──────────────────────────────────────────────────────────
 
@@ -1375,8 +2045,41 @@ class OrchestratorClient:
         capability = step["capability"]
         total      = len(steps)
 
-        # Resolve {{steps[N].output.field}} references
-        input_data = _resolve_step_refs(step.get("input_data", {}), outputs)
+        # Resolve {{steps[N].output.field}} references.  A reference that cannot
+        # be resolved is a plan/data-shape bug: fail here rather than dispatching
+        # None (or the literal template text) downstream, where it would surface
+        # as a misleading "missing parameter" error against the wrong step.
+        try:
+            input_data = _resolve_step_refs(
+                step.get("input_data", {}), outputs, current_index=step_index,
+            )
+        except StepRefError as exc:
+            blame = (
+                f" Step {exc.producing_step + 1} "
+                f"('{steps[exc.producing_step].get('name', '?')}') produced the "
+                f"output being referenced."
+                if exc.producing_step is not None
+                and exc.producing_step < len(steps)
+                else ""
+            )
+            err = f"Unresolved step reference: {exc}{blame}"
+            logger.warning("Workflow %s step %d: %s", task_id[:8], step_index + 1, err)
+            await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
+            await self._handle_workflow_failure(
+                ws=ws,
+                task_id=task_id,
+                workflow=workflow,
+                step_index=step_index,
+                step=step,
+                err_msg=err,
+                duration_ms=0,
+                replan_context={
+                    "reason": "unresolved_step_reference",
+                    "reference": exc.ref,
+                    "producing_step": exc.producing_step,
+                },
+            )
+            return
         if isinstance(input_data, dict):
             input_data = _normalise_step_input(capability, input_data)
 
@@ -2934,7 +3637,11 @@ class OrchestratorClient:
         capability = step["capability"]
         total      = len(steps)
 
-        hint_input = _resolve_step_refs(step.get("input_data", {}), outputs)
+        # Best-effort only: the emergent runner discovers real values by observing
+        # tool results, so an unresolvable hint must not abort the step.
+        hint_input = _resolve_step_refs(
+            step.get("input_data", {}), outputs, strict=False, current_index=step_index,
+        )
         if not isinstance(hint_input, dict):
             hint_input = {}
 
